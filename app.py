@@ -5,7 +5,6 @@ from flask import Flask
 
 from models import init_db
 from routes_auth import auth_bp
-from routes_oauth import oauth_bp
 
 
 load_dotenv()
@@ -21,7 +20,6 @@ def create_app():
     app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
     init_db()
     app.register_blueprint(auth_bp)
-    app.register_blueprint(oauth_bp)
     return app
 
 
