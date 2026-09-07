@@ -29,16 +29,8 @@
             <section class="app-section" aria-labelledby="websites-heading">
                 <h2 id="websites-heading">Websites you can access</h2>
                 <ul class="app-list">
-                    {% if student_dashboard_authorized %}
                     <li><a class="app-link" href="https://student-dashboard-v2.onrender.com/auth/login">Student
                             Dashboard</a></li>
-                    {% endif %}
-                    {% for website in authorized_websites %}
-                    <li><a class="app-link" href="{{ website.url }}">{{ website.name }}</a></li>
-                    {% endfor %}
-                    {% if not student_dashboard_authorized and not authorized_websites %}
-                    <li class="muted">No websites are currently authorized.</li>
-                    {% endif %}
                 </ul>
             </section>
         </section>
