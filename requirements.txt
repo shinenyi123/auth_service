@@ -1,7 +1,5 @@
 Flask
 psycopg2-binary
 python-dotenv
-PyJWT
-cryptography
 requests
 gunicorn
