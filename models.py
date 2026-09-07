@@ -83,25 +83,7 @@ def init_db():
             cursor.execute('ALTER TABLE otp_codes RENAME COLUMN otp_code TO otp_hash')
         cursor.execute("ALTER TABLE otp_codes ADD COLUMN IF NOT EXISTS website_id INTEGER REFERENCES websites(id) ON DELETE SET NULL")
         cursor.execute("ALTER TABLE otp_codes ADD COLUMN IF NOT EXISTS consumed_at TIMESTAMPTZ")
-        cursor.execute('''CREATE TABLE IF NOT EXISTS oauth_clients
-            (id SERIAL PRIMARY KEY, client_id TEXT UNIQUE NOT NULL,
-             client_secret_hash TEXT NOT NULL,
-             website_id INTEGER NOT NULL REFERENCES websites(id) ON DELETE CASCADE,
-             allowed_redirect_uris TEXT[] NOT NULL DEFAULT '{}',
-             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())''')
-        cursor.execute('''CREATE TABLE IF NOT EXISTS auth_codes
-            (id SERIAL PRIMARY KEY, code TEXT UNIQUE NOT NULL,
-             user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-             client_id TEXT NOT NULL, redirect_uri TEXT NOT NULL,
-             expires_at TIMESTAMPTZ NOT NULL, consumed_at TIMESTAMPTZ)''')
-        cursor.execute('''CREATE TABLE IF NOT EXISTS refresh_tokens
-            (id SERIAL PRIMARY KEY, token_hash TEXT NOT NULL,
-             user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-             client_id TEXT, expires_at TIMESTAMPTZ NOT NULL,
-             revoked_at TIMESTAMPTZ, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())''')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_users_email ON users(email)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_user_websites_pair ON user_websites(user_id, website_id)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_otp_email_purpose ON otp_codes(email, purpose)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_otp_expires ON otp_codes(expires_at)')
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_auth_codes_code ON auth_codes(code)')
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_refresh_token_hash ON refresh_tokens(token_hash)')
