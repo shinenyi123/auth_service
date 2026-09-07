@@ -1,14 +1,13 @@
 from datetime import datetime, timedelta, timezone
-from secrets import token_urlsafe
 import time
-from urllib.parse import urlencode, urlparse, urlunparse
+import hmac
+import os
 
 from flask import Blueprint, jsonify, redirect, render_template, request, session, url_for
 
 from models import connection, normalize_email
 from otp import create_otp, verify_otp
 from passwords import hash_password, verify_password
-from tokens import issue_access_token, issue_refresh_token
 
 
 auth_bp = Blueprint('auth', __name__)
@@ -42,52 +41,17 @@ def login_rate_limited(email):
     return False
 
 
-def client_context(client_id, redirect_uri):
-    if not client_id or not redirect_uri:
-        return None
-    with connection() as conn:
-        cursor = conn.cursor()
-        cursor.execute('''SELECT oc.website_id, oc.allowed_redirect_uris
-            FROM oauth_clients oc WHERE oc.client_id = %s''', (client_id,))
-        client = cursor.fetchone()
-    if not client or redirect_uri not in (client[1] or []):
-        return None
-    return {'client_id': client_id, 'redirect_uri': redirect_uri, 'website_id': client[0]}
-
-
-def redirect_with_code(user_id, email, context, state=''):
-    from secrets import token_urlsafe
-    from models import connection
-
-    code = token_urlsafe(32)
-    with connection() as conn:
-        cursor = conn.cursor()
-        cursor.execute('''INSERT INTO auth_codes
-            (code, user_id, client_id, redirect_uri, expires_at)
-            VALUES (%s, %s, %s, %s, %s)''',
-            (code, user_id, context['client_id'], context['redirect_uri'],
-             datetime.now(timezone.utc) + timedelta(seconds=60)))
-    query = {'code': code}
-    if state:
-        query['state'] = state
-    parsed = urlparse(context['redirect_uri'])
-    return urlunparse(parsed._replace(query=urlencode(query)))
-
-
-def complete_login(user_id, email, context=None, state=''):
+def complete_login(user_id, email):
     session.clear()
     session['user_id'] = user_id
     session['email'] = email
-    if context:
-        return redirect(redirect_with_code(user_id, email, context, state))
     return redirect(url_for('auth.websites'))
 
 
-def flow_context(payload):
-    context = client_context(payload.get('client_id'), payload.get('redirect_uri'))
-    if payload.get('client_id') or payload.get('redirect_uri'):
-        return context
-    return None
+def internal_auth_authorized():
+    expected = os.environ.get('AUTH_SERVICE_API_KEY', '')
+    supplied = request.headers.get('X-Auth-Service-Key', '')
+    return bool(expected) and hmac.compare_digest(supplied, expected)
 
 
 @auth_bp.get('/')
@@ -99,16 +63,9 @@ def home():
 
 @auth_bp.get('/login')
 def login_page():
-    payload = request.args
-    if payload.get('client_id') or payload.get('redirect_uri'):
-        if not client_context(payload.get('client_id'), payload.get('redirect_uri')):
-            return 'Invalid client or redirect URI', 400
     if session.get('user_id'):
-        context = client_context(payload.get('client_id'), payload.get('redirect_uri')) if payload.get('client_id') else None
-        if context:
-            return redirect_with_code(session['user_id'], session['email'], context, payload.get('state', ''))
         return redirect(url_for('auth.websites'))
-    return render_template('login.html', next_url=request.full_path)
+    return render_template('login.html')
 
 
 @auth_bp.post('/login')
@@ -117,10 +74,6 @@ def login_submit():
     email = normalize_email(payload.get('email'))
     if login_rate_limited(email):
         return render_template('login.html', error='Too many login attempts. Please try again later.', next_url=request.full_path), 429
-    context = flow_context(payload)
-    if payload.get('client_id') or payload.get('redirect_uri'):
-        if context is None:
-            return 'Invalid client or redirect URI', 400
     with connection() as conn:
         cursor = conn.cursor()
         cursor.execute('SELECT id, email, password_hash FROM users WHERE email = %s', (email,))
@@ -129,43 +82,41 @@ def login_submit():
         return render_template(
             'login.html',
             error='Invalid email or password.',
-            client_id=payload.get('client_id', ''),
-            redirect_uri=payload.get('redirect_uri', ''),
-            state=payload.get('state', ''),
         ), 401
     LOGIN_ATTEMPTS.pop(f'{request.remote_addr}:{email}', None)
-    return complete_login(user[0], user[1], context, payload.get('state', ''))
+    return complete_login(user[0], user[1])
+
+
+@auth_bp.post('/api/authenticate')
+def authenticate():
+    if not internal_auth_authorized():
+        return jsonify({'success': False, 'error': 'Unauthorized.'}), 401
+
+    payload = request_data()
+    email = normalize_email(payload.get('email'))
+    password = str(payload.get('password', ''))
+    website_slug = str(payload.get('website_slug', '')).strip()
+    with connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute('''SELECT id, email, password_hash, is_verified
+            FROM users WHERE email = %s''', (email,))
+        user = cursor.fetchone()
+
+        if not user or not user[3] or not verify_password(user[2], password):
+            return jsonify({'success': False, 'error': 'Invalid email or password'}), 401
+
+        cursor.execute('''SELECT 1 FROM user_websites uw
+            JOIN websites w ON w.id = uw.website_id
+            WHERE uw.user_id = %s AND w.slug = %s''', (user[0], website_slug))
+        if not cursor.fetchone():
+            return jsonify({'success': False, 'error': 'You are not authorized to access this website.'}), 403
+
+    return jsonify({'success': True, 'user': {'id': user[0], 'email': user[1]}})
 
 
 @auth_bp.get('/signup')
 def signup_page():
     return render_template('signup.html')
-
-
-@auth_bp.get('/apps')
-def apps():
-    if not session.get('user_id'):
-        return redirect(url_for('auth.login_page'))
-
-    user_id = session['user_id']
-    with connection() as conn:
-        cursor = conn.cursor()
-        cursor.execute('''SELECT DISTINCT ON (w.id)
-                w.id, w.name, w.base_url
-            FROM user_websites uw
-            JOIN websites w ON w.id = uw.website_id
-            JOIN oauth_clients oc ON oc.website_id = w.id
-            WHERE uw.user_id = %s
-              AND COALESCE(array_length(oc.allowed_redirect_uris, 1), 0) > 0
-            ORDER BY w.id, oc.id''', (user_id,))
-        accessible_rows = cursor.fetchall()
-
-    accessible_apps = [
-        {'name': row[1], 'website_url': row[2].rstrip('/') + '/'}
-        for row in accessible_rows
-        if row[2]
-    ]
-    return render_template('apps.html', accessible_apps=accessible_apps)
 
 
 @auth_bp.get('/websites')
@@ -175,22 +126,24 @@ def websites():
 
     with connection() as conn:
         cursor = conn.cursor()
-        cursor.execute('''SELECT w.name, w.base_url
+        cursor.execute('''SELECT w.name, w.base_url, w.slug
             FROM user_websites uw
             JOIN websites w ON w.id = uw.website_id
             WHERE uw.user_id = %s AND w.base_url IS NOT NULL
             ORDER BY w.name''', (session['user_id'],))
         website_rows = cursor.fetchall()
 
+    student_dashboard_authorized = any(row[2] == 'student-dashboard' for row in website_rows)
     authorized_websites = [
         {'name': row[0], 'url': row[1]}
         for row in website_rows
-        if row[0] and row[1]
+        if row[0] and row[1] and row[2] != 'student-dashboard'
     ]
     return render_template(
         'websites.html',
         email=session.get('email', ''),
         authorized_websites=authorized_websites,
+        student_dashboard_authorized=student_dashboard_authorized,
     )
 
 
@@ -200,22 +153,18 @@ def signup_request_otp():
     email = normalize_email(payload.get('email'))
     if not valid_email(email):
         return jsonify({'error': 'Please enter a valid email address.'}), 400
-    context = flow_context(payload)
-    if payload.get('client_id') or payload.get('redirect_uri'):
-        if context is None:
-            return jsonify({'error': 'Invalid client or redirect URI.'}), 400
     with connection() as conn:
         cursor = conn.cursor()
         cursor.execute('SELECT 1 FROM users WHERE email = %s', (email,))
         if cursor.fetchone():
             return jsonify({'error': 'An account with this email already exists.'}), 409
     try:
-        create_otp(email, 'signup', context.get('website_id') if context else None)
+        create_otp(email, 'signup')
     except ValueError as error:
         return jsonify({'error': str(error)}), 429
     except Exception:
         return jsonify({'error': 'Unable to send verification email.'}), 503
-    session['signup_context'] = {'email': email, 'client_id': payload.get('client_id'), 'redirect_uri': payload.get('redirect_uri'), 'state': payload.get('state', '')}
+    session['signup_context'] = {'email': email}
     return jsonify({'message': 'Verification code sent.'})
 
 
@@ -246,21 +195,10 @@ def signup_set_password():
         cursor.execute('''INSERT INTO users (email, password_hash, is_verified)
             VALUES (%s, %s, TRUE) RETURNING id''', (email, hash_password(payload['password'])))
         user_id = cursor.fetchone()[0]
-        if context_data.get('client_id'):
-            context = client_context(context_data['client_id'], context_data.get('redirect_uri'))
-            if context:
-                cursor.execute('''INSERT INTO user_websites (user_id, website_id)
-                    VALUES (%s, %s) ON CONFLICT (user_id, website_id) DO NOTHING''',
-                    (user_id, context['website_id']))
     session.pop('signup_verified', None)
     session.pop('signup_context', None)
     session.clear()
-    login_parameters = {
-        key: context_data[key]
-        for key in ('client_id', 'redirect_uri', 'state')
-        if context_data.get(key)
-    }
-    return redirect(url_for('auth.login_page', **login_parameters))
+    return redirect(url_for('auth.login_page'))
 
 
 @auth_bp.get('/forgot-password')
