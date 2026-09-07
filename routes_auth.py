@@ -80,7 +80,7 @@ def complete_login(user_id, email, context=None, state=''):
     session['email'] = email
     if context:
         return redirect(redirect_with_code(user_id, email, context, state))
-    return redirect(url_for('auth.apps'))
+    return redirect(url_for('auth.websites'))
 
 
 def flow_context(payload):
@@ -93,7 +93,7 @@ def flow_context(payload):
 @auth_bp.get('/')
 def home():
     if session.get('user_id'):
-        return redirect(url_for('auth.apps'))
+        return redirect(url_for('auth.websites'))
     return redirect(url_for('auth.login_page'))
 
 
@@ -107,7 +107,7 @@ def login_page():
         context = client_context(payload.get('client_id'), payload.get('redirect_uri')) if payload.get('client_id') else None
         if context:
             return redirect_with_code(session['user_id'], session['email'], context, payload.get('state', ''))
-        return redirect(url_for('auth.apps'))
+        return redirect(url_for('auth.websites'))
     return render_template('login.html', next_url=request.full_path)
 
 
@@ -151,7 +151,7 @@ def apps():
     with connection() as conn:
         cursor = conn.cursor()
         cursor.execute('''SELECT DISTINCT ON (w.id)
-                w.id, w.name, oc.client_id, oc.allowed_redirect_uris[1]
+                w.id, w.name, w.base_url
             FROM user_websites uw
             JOIN websites w ON w.id = uw.website_id
             JOIN oauth_clients oc ON oc.website_id = w.id
@@ -159,32 +159,39 @@ def apps():
               AND COALESCE(array_length(oc.allowed_redirect_uris, 1), 0) > 0
             ORDER BY w.id, oc.id''', (user_id,))
         accessible_rows = cursor.fetchall()
-        cursor.execute('''SELECT DISTINCT ON (w.id)
-                w.id, w.name, oc.client_id, oc.allowed_redirect_uris[1]
-            FROM websites w
-            JOIN oauth_clients oc ON oc.website_id = w.id
-            WHERE NOT EXISTS (
-                SELECT 1 FROM user_websites uw
-                WHERE uw.user_id = %s AND uw.website_id = w.id
-            )
-              AND COALESCE(array_length(oc.allowed_redirect_uris, 1), 0) > 0
-            ORDER BY w.id, oc.id''', (user_id,))
-        available_rows = cursor.fetchall()
 
-    hub_states = session.get('hub_states', {})
+    accessible_apps = [
+        {'name': row[1], 'website_url': row[2].rstrip('/') + '/'}
+        for row in accessible_rows
+        if row[2]
+    ]
+    return render_template('apps.html', accessible_apps=accessible_apps)
 
-    def app_link(row):
-        state = token_urlsafe(32)
-        hub_states[state] = {'website_id': row[0], 'created_at': datetime.now(timezone.utc).isoformat()}
-        return {
-            'name': row[1],
-            'login_url': url_for('auth.login_page', client_id=row[2], redirect_uri=row[3], state=state),
-        }
 
-    accessible_apps = [app_link(row) for row in accessible_rows]
-    available_apps = [app_link(row) for row in available_rows]
-    session['hub_states'] = hub_states
-    return render_template('apps.html', accessible_apps=accessible_apps, available_apps=available_apps)
+@auth_bp.get('/websites')
+def websites():
+    if not session.get('user_id'):
+        return redirect(url_for('auth.login_page'))
+
+    with connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute('''SELECT w.name, w.base_url
+            FROM user_websites uw
+            JOIN websites w ON w.id = uw.website_id
+            WHERE uw.user_id = %s AND w.base_url IS NOT NULL
+            ORDER BY w.name''', (session['user_id'],))
+        website_rows = cursor.fetchall()
+
+    authorized_websites = [
+        {'name': row[0], 'url': row[1]}
+        for row in website_rows
+        if row[0] and row[1]
+    ]
+    return render_template(
+        'websites.html',
+        email=session.get('email', ''),
+        authorized_websites=authorized_websites,
+    )
 
 
 @auth_bp.post('/api/signup/request-otp')
@@ -245,10 +252,15 @@ def signup_set_password():
                 cursor.execute('''INSERT INTO user_websites (user_id, website_id)
                     VALUES (%s, %s) ON CONFLICT (user_id, website_id) DO NOTHING''',
                     (user_id, context['website_id']))
-    context = client_context(context_data.get('client_id'), context_data.get('redirect_uri')) if context_data.get('client_id') else None
     session.pop('signup_verified', None)
     session.pop('signup_context', None)
-    return complete_login(user_id, email, context, context_data.get('state', ''))
+    session.clear()
+    login_parameters = {
+        key: context_data[key]
+        for key in ('client_id', 'redirect_uri', 'state')
+        if context_data.get(key)
+    }
+    return redirect(url_for('auth.login_page', **login_parameters))
 
 
 @auth_bp.get('/forgot-password')
