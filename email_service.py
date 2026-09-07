@@ -17,7 +17,7 @@ def _required(name):
 
 
 def _api_url():
-    value = os.environ.get('EMAIL_API_URL', 'https://api.resend.com/emails').strip()
+    value = os.environ.get('EMAIL_API_URL', 'https://api.brevo.com/v3/smtp/email').strip()
     try:
         parsed = urlparse(value)
         port = parsed.port
@@ -29,9 +29,13 @@ def _api_url():
 
 
 def _sender():
+    # EMAIL_FROM must exactly match a verified Brevo Sender; Gmail-style addresses are allowed.
     address = _required('EMAIL_FROM')
     name = os.environ.get('EMAIL_FROM_NAME', '').strip()
-    return f'{name} <{address}>' if name else address
+    sender = {'email': address}
+    if name:
+        sender['name'] = name
+    return sender
 
 
 def send_otp_email(email, otp, purpose):
@@ -39,11 +43,11 @@ def send_otp_email(email, otp, purpose):
     action_html = html.escape(action)
     code_html = html.escape(str(otp))
     payload = {
-        'from': _sender(),
-        'to': [email],
+        'sender': _sender(),
+        'to': [{'email': email}],
         'subject': 'Authentication verification code',
-        'text': f'Your code to {action} is {otp}. It expires in 10 minutes.',
-        'html': (
+        'textContent': f'Your code to {action} is {otp}. It expires in 10 minutes.',
+        'htmlContent': (
             f'<p>Your code to {action_html} is '
             f'<strong>{code_html}</strong>. It expires in 10 minutes.</p>'
         ),
@@ -53,8 +57,9 @@ def send_otp_email(email, otp, purpose):
         response = requests.post(
             _api_url(),
             headers={
-                'Authorization': f'Bearer {_required("EMAIL_API_KEY")}',
-                'Content-Type': 'application/json',
+                'api-key': _required('EMAIL_API_KEY'),
+                'accept': 'application/json',
+                'content-type': 'application/json',
             },
             json=payload,
             timeout=10,
@@ -71,5 +76,5 @@ def send_otp_email(email, otp, purpose):
         response_data = response.json()
     except ValueError as error:
         raise EmailDeliveryError('Email provider returned an invalid response') from error
-    if not isinstance(response_data, dict) or not response_data.get('id'):
+    if not isinstance(response_data, dict) or not response_data.get('messageId'):
         raise EmailDeliveryError('Email provider did not confirm the message')
