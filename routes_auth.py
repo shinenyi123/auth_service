@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta, timezone
+from secrets import token_urlsafe
 import time
 from urllib.parse import urlencode, urlparse, urlunparse
 
@@ -79,7 +80,7 @@ def complete_login(user_id, email, context=None, state=''):
     session['email'] = email
     if context:
         return redirect(redirect_with_code(user_id, email, context, state))
-    return redirect('/')
+    return redirect(url_for('auth.apps'))
 
 
 def flow_context(payload):
@@ -87,6 +88,13 @@ def flow_context(payload):
     if payload.get('client_id') or payload.get('redirect_uri'):
         return context
     return None
+
+
+@auth_bp.get('/')
+def home():
+    if session.get('user_id'):
+        return redirect(url_for('auth.apps'))
+    return redirect(url_for('auth.login_page'))
 
 
 @auth_bp.get('/login')
@@ -99,7 +107,7 @@ def login_page():
         context = client_context(payload.get('client_id'), payload.get('redirect_uri')) if payload.get('client_id') else None
         if context:
             return redirect_with_code(session['user_id'], session['email'], context, payload.get('state', ''))
-        return redirect('/')
+        return redirect(url_for('auth.apps'))
     return render_template('login.html', next_url=request.full_path)
 
 
@@ -132,6 +140,51 @@ def login_submit():
 @auth_bp.get('/signup')
 def signup_page():
     return render_template('signup.html')
+
+
+@auth_bp.get('/apps')
+def apps():
+    if not session.get('user_id'):
+        return redirect(url_for('auth.login_page'))
+
+    user_id = session['user_id']
+    with connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute('''SELECT DISTINCT ON (w.id)
+                w.id, w.name, oc.client_id, oc.allowed_redirect_uris[1]
+            FROM user_websites uw
+            JOIN websites w ON w.id = uw.website_id
+            JOIN oauth_clients oc ON oc.website_id = w.id
+            WHERE uw.user_id = %s
+              AND COALESCE(array_length(oc.allowed_redirect_uris, 1), 0) > 0
+            ORDER BY w.id, oc.id''', (user_id,))
+        accessible_rows = cursor.fetchall()
+        cursor.execute('''SELECT DISTINCT ON (w.id)
+                w.id, w.name, oc.client_id, oc.allowed_redirect_uris[1]
+            FROM websites w
+            JOIN oauth_clients oc ON oc.website_id = w.id
+            WHERE NOT EXISTS (
+                SELECT 1 FROM user_websites uw
+                WHERE uw.user_id = %s AND uw.website_id = w.id
+            )
+              AND COALESCE(array_length(oc.allowed_redirect_uris, 1), 0) > 0
+            ORDER BY w.id, oc.id''', (user_id,))
+        available_rows = cursor.fetchall()
+
+    hub_states = session.get('hub_states', {})
+
+    def app_link(row):
+        state = token_urlsafe(32)
+        hub_states[state] = {'website_id': row[0], 'created_at': datetime.now(timezone.utc).isoformat()}
+        return {
+            'name': row[1],
+            'login_url': url_for('auth.login_page', client_id=row[2], redirect_uri=row[3], state=state),
+        }
+
+    accessible_apps = [app_link(row) for row in accessible_rows]
+    available_apps = [app_link(row) for row in available_rows]
+    session['hub_states'] = hub_states
+    return render_template('apps.html', accessible_apps=accessible_apps, available_apps=available_apps)
 
 
 @auth_bp.post('/api/signup/request-otp')
