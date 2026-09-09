@@ -27,10 +27,13 @@
             </header>
 
             <section class="app-section" aria-labelledby="websites-heading">
-                <h2 id="websites-heading">Websites you can access</h2>
+                <h2 id="websites-heading">Available websites</h2>
                 <ul class="app-list">
-                    <li><a class="app-link" href="https://student-dashboard-v2.onrender.com/auth/login">Student
-                            Dashboard</a></li>
+                    {% for website in websites %}
+                    <li><a class="app-link" href="{{ website.url }}">{{ website.name }}</a></li>
+                    {% else %}
+                    <li>No websites are configured yet.</li>
+                    {% endfor %}
                 </ul>
             </section>
         </section>
