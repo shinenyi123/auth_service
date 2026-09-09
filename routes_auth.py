@@ -1,7 +1,5 @@
 from datetime import datetime, timedelta, timezone
 import time
-import hmac
-import os
 
 from flask import Blueprint, jsonify, redirect, render_template, request, session, url_for
 
@@ -48,12 +46,6 @@ def complete_login(user_id, email):
     return redirect(url_for('auth.websites'))
 
 
-def internal_auth_authorized():
-    expected = os.environ.get('AUTH_SERVICE_API_KEY', '')
-    supplied = request.headers.get('X-Auth-Service-Key', '')
-    return bool(expected) and hmac.compare_digest(supplied, expected)
-
-
 @auth_bp.get('/')
 def home():
     if session.get('user_id'):
@@ -87,33 +79,6 @@ def login_submit():
     return complete_login(user[0], user[1])
 
 
-@auth_bp.post('/api/authenticate')
-def authenticate():
-    if not internal_auth_authorized():
-        return jsonify({'success': False, 'error': 'Unauthorized.'}), 401
-
-    payload = request_data()
-    email = normalize_email(payload.get('email'))
-    password = str(payload.get('password', ''))
-    website_slug = str(payload.get('website_slug', '')).strip()
-    with connection() as conn:
-        cursor = conn.cursor()
-        cursor.execute('''SELECT id, email, password_hash, is_verified
-            FROM users WHERE email = %s''', (email,))
-        user = cursor.fetchone()
-
-        if not user or not user[3] or not verify_password(user[2], password):
-            return jsonify({'success': False, 'error': 'Invalid email or password'}), 401
-
-        cursor.execute('''SELECT 1 FROM user_websites uw
-            JOIN websites w ON w.id = uw.website_id
-            WHERE uw.user_id = %s AND w.slug = %s''', (user[0], website_slug))
-        if not cursor.fetchone():
-            return jsonify({'success': False, 'error': 'You are not authorized to access this website.'}), 403
-
-    return jsonify({'success': True, 'user': {'id': user[0], 'email': user[1]}})
-
-
 @auth_bp.get('/signup')
 def signup_page():
     return render_template('signup.html')
@@ -126,24 +91,17 @@ def websites():
 
     with connection() as conn:
         cursor = conn.cursor()
-        cursor.execute('''SELECT w.name, w.base_url, w.slug
-            FROM user_websites uw
-            JOIN websites w ON w.id = uw.website_id
-            WHERE uw.user_id = %s AND w.base_url IS NOT NULL
-            ORDER BY w.name''', (session['user_id'],))
+        cursor.execute('''SELECT name, base_url
+            FROM websites
+            WHERE base_url IS NOT NULL
+            ORDER BY name''')
         website_rows = cursor.fetchall()
 
-    student_dashboard_authorized = any(row[2] == 'student-dashboard' for row in website_rows)
-    authorized_websites = [
-        {'name': row[0], 'url': row[1]}
-        for row in website_rows
-        if row[0] and row[1] and row[2] != 'student-dashboard'
-    ]
+    websites = [{'name': row[0], 'url': row[1]} for row in website_rows if row[0] and row[1]]
     return render_template(
         'websites.html',
         email=session.get('email', ''),
-        authorized_websites=authorized_websites,
-        student_dashboard_authorized=student_dashboard_authorized,
+        websites=websites,
     )
 
 
@@ -189,7 +147,6 @@ def signup_set_password():
     error = password_error(str(payload.get('password', '')))
     if error:
         return jsonify({'error': error}), 400
-    context_data = session.get('signup_context') or {}
     with connection() as conn:
         cursor = conn.cursor()
         cursor.execute('''INSERT INTO users (email, password_hash, is_verified)
@@ -198,7 +155,9 @@ def signup_set_password():
     session.pop('signup_verified', None)
     session.pop('signup_context', None)
     session.clear()
-    return redirect(url_for('auth.login_page'))
+    session['user_id'] = user_id
+    session['email'] = email
+    return jsonify({'message': 'Account created.', 'redirect': url_for('auth.websites')})
 
 
 @auth_bp.get('/forgot-password')
